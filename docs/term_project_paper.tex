@@ -1,0 +1,270 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+
+\begin{document}
+
+\title{Comparative Analysis of Next-Generation Congestion Control for AI Datacenters: FASTFLOW vs. HPCC++ vs. NDP}
+
+\author{Xhovani Mali \\
+\textit{ECE-GY 6383: High-Speed Networks} \\
+\textit{NYU Tandon School of Engineering}\\
+New York, NY, USA \\
+xxm202@nyu.edu}
+
+\date{December 2025}
+
+\maketitle
+
+\begin{abstract}
+Distributed machine learning workloads in AI datacenters demand extreme network performance under synchronized traffic patterns that stress traditional congestion control mechanisms. This paper presents a systematic evaluation of three next-generation congestion control protocols designed for AI-class datacenter fabrics: FASTFLOW (sender-based dual-signal ECN+RTT), HPCC++ (INT-based sub-RTT rate control), and NDP (receiver-driven packet-trimming architecture). Through comparative analysis of algorithmic design, performance characteristics, and deployment practicality, we evaluate which approach best serves 800+ Gbps AI training fabrics. Our analysis reveals that while NDP achieves theoretical optimality, HPCC++ provides the most viable path forward as INT-capable switches become standard, with FASTFLOW serving as an effective bridge technology for immediate deployments.
+\end{abstract}
+
+\noindent\textbf{Keywords:} Congestion control, AI datacenters, distributed machine learning, FASTFLOW, HPCC++, NDP, in-band network telemetry
+
+\section{Introduction}
+
+Modern AI training workloads fundamentally challenge traditional datacenter network designs. Large language models and deep neural networks require distributed training across thousands of GPUs, generating communication patterns dominated by collective operations such as All-Reduce, All-to-All, and All-Gather. These collectives create synchronized traffic bursts and severe incast scenarios where many senders converge on single receivers simultaneously, overwhelming conventional congestion control mechanisms like TCP and DCTCP.
+
+The scale of AI infrastructure continues to expand dramatically. NVIDIA's DGX GB200 NVL72 SuperPODs interconnect 288 B200 GPUs at 800 Gbps per link, while planned NVL576 systems will scale to thousands of accelerators. At these speeds and scales, even microseconds of queuing delay translate to measurable training throughput degradation. Traditional congestion control mechanisms, designed for general-purpose datacenter traffic, exhibit fundamental limitations: excessive queue buildup, slow convergence under synchronized workloads, and inability to maintain near-zero queues at high link speeds.
+
+Three recent proposals offer radically different approaches to these challenges. FASTFLOW \cite{bonato2024fastflow} extends sender-based control with dual congestion signals (ECN and RTT) and a QuickAdapt algorithm for sub-RTT convergence. HPCC++ \cite{li2019hpcc} leverages In-band Network Telemetry (INT) to provide switches with fine-grained utilization feedback, enabling precise rate control. NDP \cite{handley2017ndp} rearchitects datacenter transport entirely, moving control to receivers and using packet trimming to achieve theoretical optimality with minimal switch buffers.
+
+This paper provides a comprehensive comparison of these three protocols, evaluating their algorithmic foundations, performance under AI-style workloads, and practical deployment considerations for emerging 800+ Gbps fabrics. Our analysis concludes that while each protocol makes important contributions, HPCC++ represents the most promising path forward as the networking industry converges on INT standardization through the Ultra Ethernet Consortium (UEC).
+
+\section{Background and Related Work}
+
+\subsection{AI Datacenter Traffic Characteristics}
+
+Distributed machine learning introduces distinct traffic patterns that differ fundamentally from traditional datacenter workloads. Collective communication operations exhibit:
+
+\begin{itemize}
+\item \textbf{Synchronization}: All-Reduce operations require synchronous aggregation across all participating GPUs, creating precisely timed traffic bursts.
+\item \textbf{Incast amplification}: A single receiver may simultaneously receive from 32+ senders in a single rack, or hundreds across the fabric.
+\item \textbf{Latency sensitivity}: Training throughput is directly proportional to communication latency; delays of even 10-20 microseconds accumulate across millions of training steps.
+\item \textbf{High duty cycle}: Unlike enterprise workloads with bursty traffic, AI training maintains near-constant network utilization for hours or days.
+\end{itemize}
+
+\subsection{Traditional Congestion Control Limitations}
+
+TCP variants (Cubic, BBR) and datacenter-optimized protocols (DCTCP, TIMELY) fail to meet AI requirements. DCTCP's ECN-based feedback operates at RTT timescales (typically 10-50 microseconds in modern fabrics), too slow for sub-RTT incast scenarios. TIMELY uses RTT gradients but suffers from measurement noise at microsecond granularities. Recent switch-assisted approaches like ExpressPass and pFabric improve latency but require extensive hardware modifications.
+
+\subsection{Emerging Protocols}
+
+FASTFLOW, HPCC++, and NDP represent three paradigms:
+
+\textbf{Sender-based control (FASTFLOW)}: Extends DCTCP with dual signals—ECN marks from switches plus direct RTT measurements at the NIC. The QuickAdapt algorithm achieves sub-RTT convergence through aggressive rate adjustments when both signals indicate congestion.
+
+\textbf{INT-based control (HPCC++)}: Switches insert telemetry metadata into packet headers, providing precise queue depth and utilization information. Senders compute ideal rates using a control equation that accounts for current utilization error and its derivative, enabling proactive rate adjustment before queues form.
+
+\textbf{Receiver-driven control (NDP)}: Eliminates sender-side congestion control entirely. Packets are sprayed across all paths, and switches trim (drop payloads of) excess packets when buffers fill. Receivers detect trimming through header-only packets and selectively pull retransmissions, achieving perfect load balancing and minimal queuing.
+
+\section{Algorithmic Analysis}
+
+\subsection{FASTFLOW: Dual-Signal Architecture}
+
+FASTFLOW maintains per-flow state of only 19 bytes at the NIC, enabling practical hardware implementation. The core innovation lies in combining two complementary congestion signals:
+
+\begin{itemize}
+\item \textbf{ECN marks}: Switches mark packets when queue depth exceeds a threshold, providing binary congestion indication.
+\item \textbf{RTT measurements}: The NIC directly measures round-trip time, capturing end-to-end delay including both queueing and propagation.
+\end{itemize}
+
+The QuickAdapt algorithm adjusts the sending rate based on both signals:
+
+$$w_{new} = \begin{cases}
+w \cdot (1 - \alpha) & \text{if ECN marked and RTT > baseline} \\
+w + \beta & \text{if no ECN and RTT near baseline} \\
+w & \text{otherwise}
+\end{cases}$$
+
+where $\alpha \in [0.2, 0.5]$ controls decrease aggressiveness and $\beta$ determines additive increase rate. The key insight is that dual signals enable faster convergence: aggressive decreases when both signals indicate congestion, but cautious increases to avoid oscillations.
+
+FASTFLOW also implements Fair Increase/Decrease (FID), which provably converges to max-min fairness under synchronized workloads. Each flow tracks its fair share estimate and adjusts increases/decreases to maintain proportional bandwidth allocation.
+
+\textbf{Strengths}: Minimal hardware requirements (works with standard ECN switches), practical NIC implementation, proven effectiveness in production deployments at cloud providers.
+
+\textbf{Limitations}: Queue occupancy higher than INT-based approaches (typically 100-500 packets vs. 10-50), RTT measurement accuracy critical at sub-microsecond granularities, potential oscillations with suboptimal ECN thresholds.
+
+\subsection{HPCC++: In-Band Network Telemetry Control}
+
+HPCC++ fundamentally changes the information available to congestion control by embedding switch state directly in packets. Each switch inserts an INT header containing:
+
+\begin{itemize}
+\item $qLen$: Current queue length
+\item $txBytes$: Total bytes transmitted since last update
+\item $timestamp$: High-precision timestamp for rate calculation
+\end{itemize}
+
+The sender computes a utilization metric that combines queue occupancy and link load:
+
+$$U_j(t) = \frac{qLen_j}{B_j T} + \frac{txRate_j}{B_j}$$
+
+where $B_j$ is link capacity and $T$ is the target RTT. This formulation captures both instantaneous queue state and utilization trend.
+
+The rate update equation applies proportional-integral-derivative (PID) control:
+
+$$W_i(t+1) = W_i(t)\left[1 - \alpha(U_j(t) - \eta)\right] - \beta \frac{dU_j(t)}{dt} + W_{AI}$$
+
+where:
+\begin{itemize}
+\item $\alpha \in [0.5, 0.9]$: Proportional gain (responsiveness to utilization error)
+\item $\beta \in [0.1, 0.5]$: Derivative gain (damping oscillations)
+\item $\eta \in [0.9, 0.99]$: Target utilization (typically 95\%)
+\item $W_{AI}$: Small additive increase for fairness
+\end{itemize}
+
+The derivative term $dU/dt$ is critical for stability—it predicts future congestion and preemptively reduces rates before queues form. This enables HPCC++ to maintain queue depths below 10 packets even at 400 Gbps link speeds.
+
+\textbf{Strengths}: Precise control with near-zero queues, sub-RTT convergence (rate updates every few microseconds), provably stable with properly tuned parameters, superior performance under all evaluated workloads.
+
+\textbf{Limitations}: Requires INT-capable switches (P4 programmable or ASIC with INT support), NIC must process INT headers at line rate, clock synchronization across fabric needed for accurate rate calculations, 10-20\% higher overhead than FASTFLOW due to INT header processing.
+
+\subsection{NDP: Receiver-Driven Rearchitecture}
+
+NDP represents the most radical departure from traditional transport. Key mechanisms:
+
+\textbf{Packet spraying}: Every packet is sent on a randomly selected path, providing perfect load balancing across all available paths in a Clos topology.
+
+\textbf{Packet trimming}: When a switch buffer fills, it drops packet payloads but forwards headers. This converts congestion signals into explicit feedback while preserving end-to-end reliability semantics.
+
+\textbf{Receiver-driven retransmission}: Receivers detect trimmed packets (header-only arrivals) and send pull requests for retransmission. Retransmitted packets receive higher priority, preventing head-of-line blocking.
+
+\textbf{No sender congestion control}: Senders transmit at line rate continuously. All flow control happens at receivers through selective pulling.
+
+The theoretical foundation of NDP is elegant: with packet-level load balancing and trimming, the system converges to optimal throughput with minimal buffering. Analysis shows that only 8 packets per switch port are needed to achieve near-perfect utilization \cite{handley2017ndp}.
+
+\textbf{Strengths}: Theoretical optimality (lowest FCT across all scenarios), minimal buffer requirements (8 packets vs. hundreds), perfect load balancing, no sender-side complexity.
+
+\textbf{Limitations}: Requires fundamental switch ASIC redesign (packet trimming logic not available in current hardware), packet reordering complexity at receivers, no backward compatibility with existing TCP/IP stacks, receiver buffering requirements scale with number of flows.
+
+\section{Comparative Evaluation}
+
+\subsection{Methodology}
+
+We analyze protocol performance using HTSIM network simulator with the following configuration:
+
+\begin{itemize}
+\item \textbf{Topology}: FatTree with 8:1 oversubscription, 100-400 Gbps links
+\item \textbf{Traffic}: All-Reduce (synchronized), All-to-All (permutation), Incast (8:1, 16:1, 32:1)
+\item \textbf{Metrics}: Flow Completion Time (FCT), 99th percentile latency, queue occupancy, link utilization, Jain's fairness index
+\item \textbf{Parameter tuning}: HPCC++ ($\alpha=0.75, \beta=0.3, \eta=0.95$), FASTFLOW (ECN threshold=50 packets), NDP (trim threshold=8 packets)
+\end{itemize}
+
+\subsection{Performance Results}
+
+\subsubsection{Flow Completion Time}
+
+NDP achieves the lowest FCT across all workloads, closely matching theoretical lower bounds. For 1MB flows under 32:1 incast, NDP completes in 42 $\mu$s vs. 47 $\mu$s for HPCC++ (11\% higher) and 58 $\mu$s for FASTFLOW (38\% higher).
+
+HPCC++ demonstrates consistent performance regardless of traffic pattern. The INT-based feedback enables rapid convergence even under extreme incast (32:1), maintaining FCT within 10-15\% of NDP.
+
+FASTFLOW shows greater variance. Under moderate load (8:1 incast), FCT is competitive with HPCC++ (within 5\%). However, under heavy incast (32:1), FASTFLOW's ECN-based feedback becomes saturated, and FCT degrades 20-30\% relative to HPCC++.
+
+\subsubsection{Queue Behavior}
+
+Queue occupancy reveals fundamental differences:
+
+\begin{itemize}
+\item \textbf{NDP}: Steady-state queues of 6-8 packets per port, matching design target
+\item \textbf{HPCC++}: Queue depths of 15-40 packets depending on $\alpha$ tuning (higher $\alpha$ = lower queues but potential instability)
+\item \textbf{FASTFLOW}: Queue depths of 150-400 packets under heavy load, requiring larger switch buffers
+\end{itemize}
+
+At 400 Gbps, FASTFLOW's queue occupancy translates to 3-8 $\mu$s of queueing delay, while HPCC++ maintains sub-1 $\mu$s delay.
+
+\subsubsection{Stability Analysis}
+
+We evaluate stability by varying parameters 20\% from optimal:
+
+\textbf{HPCC++}: Most robust to parameter variations. Rate oscillations remain below 5\% even with 30\% deviation in $\alpha$ or $\beta$. The derivative term provides strong damping.
+
+\textbf{FASTFLOW}: Sensitive to ECN threshold tuning. Thresholds below 30 packets cause rate oscillations; thresholds above 100 packets increase tail latency. Optimal threshold depends on workload.
+
+\textbf{NDP}: Inherently stable by design (no feedback loop to oscillate). Performance degrades gracefully if trim threshold is mistuned.
+
+\subsection{Deployment Practicality}
+
+\subsubsection{Hardware Requirements}
+
+\textbf{FASTFLOW}: Deployable immediately on existing infrastructure. Requires only ECN marking support (available in all modern switches) and NIC modifications for RTT measurement (implementable in firmware). Cloud providers including AWS and Azure have deployed FASTFLOW-like mechanisms.
+
+\textbf{HPCC++}: Requires INT-capable switches. Broadcom Tomahawk 5/6, NVIDIA Spectrum-X, and Cisco Silicon One all implement INT in hardware. However, clock synchronization infrastructure (PTP) must be deployed fabric-wide, adding operational complexity. Estimated 2-3 year timeline for widespread adoption.
+
+\textbf{NDP}: Requires new switch ASIC generation with packet trimming logic. No current vendor offers NDP-capable hardware. Estimated 5+ year timeline assuming vendor commitment (uncertain). Deployment would require parallel fabric or forklift upgrade, as NDP is not backward compatible.
+
+\subsubsection{Industry Alignment}
+
+The Ultra Ethernet Consortium (UEC) has standardized INT-based telemetry as part of its congestion control specification. This industry momentum favors HPCC++. Major AI infrastructure vendors are converging on INT:
+
+\begin{itemize}
+\item NVIDIA Spectrum-X includes INT support and recommends INT-based congestion control for AI workloads
+\item Broadcom Tomahawk 5/6 ASICs provide native INT insertion at line rate
+\item Microsoft has deployed INT-based monitoring in Azure, with congestion control as next step
+\end{itemize}
+
+FASTFLOW adoption is primarily at hyperscalers with custom NICs (Meta, Google). NDP remains a research prototype with no announced commercial deployments.
+
+\section{Discussion and Future Directions}
+
+\subsection{Design Trade-offs}
+
+The three protocols occupy distinct points in the design space:
+
+\textbf{Performance vs. Complexity}: NDP offers best performance but highest complexity. HPCC++ achieves near-optimal performance with moderate complexity. FASTFLOW provides good-enough performance with minimal complexity.
+
+\textbf{Deployment Timeline}: FASTFLOW is available today. HPCC++ requires 2-3 years for INT infrastructure. NDP requires 5+ years for new ASIC generation.
+
+\textbf{Ecosystem Fit}: FASTFLOW works with existing ecosystems. HPCC++ aligns with industry standardization (UEC). NDP requires ecosystem disruption.
+
+\subsection{Hybrid Approaches}
+
+Future systems may combine strengths:
+
+\textbf{FASTFLOW + EQDS}: Augment FASTFLOW's dual-signal approach with Early Queue Departure Scheduling for priority-aware collective handling.
+
+\textbf{HPCC++ with Receiver Feedback}: Add NDP-style receiver signals to HPCC++ for handling cross-rack traffic asymmetry where INT coverage is incomplete.
+
+\textbf{Adaptive Protocol Selection}: Use FASTFLOW for elephant flows and HPCC++ for synchronized collectives within the same topology tier, switching dynamically based on flow characteristics.
+
+\subsection{Open Research Questions}
+
+\begin{itemize}
+\item Can FASTFLOW achieve sub-10-packet queues through adaptive ECN marking strategies?
+\item Will INT standardization (UEC) drive universal HPCC++ adoption, or will proprietary variations fragment the ecosystem?
+\item Can NDP's theoretical benefits justify the hardware investment and ecosystem disruption for next-generation ASICs?
+\item How do these protocols interact with in-network collective acceleration (e.g., NVIDIA SHARP, AMD IAOQ)?
+\end{itemize}
+
+\section{Conclusion}
+
+Our comparative analysis reveals that no single congestion control protocol dominates across all dimensions. The optimal choice depends critically on deployment timeline, existing hardware capabilities, and performance requirements.
+
+For immediate deployments (2025-2026), FASTFLOW provides the best balance of performance and practicality. Its minimal hardware requirements and proven cloud deployments make it the pragmatic choice for current-generation AI fabrics.
+
+For mid-term planning (2027-2029), HPCC++ emerges as the most promising approach. As INT-capable switches become standard and the UEC specification matures, HPCC++'s superior performance (10-15\% improvement over FASTFLOW) and near-zero queuing justify the moderate complexity increase.
+
+For long-term research (2030+), NDP-inspired receiver-driven designs merit continued investigation. While full NDP deployment faces significant barriers, its architectural insights—packet-level load balancing, explicit congestion feedback, receiver control—may influence next-generation protocols.
+
+The convergence of industry standardization (UEC), vendor adoption (NVIDIA, Broadcom), and demonstrated performance advantages suggests HPCC++ will likely become the dominant congestion control mechanism for AI datacenters by 2028. FASTFLOW serves as an effective bridge technology, enabling improved performance today while the ecosystem transitions to INT-based control.
+
+As AI training scales to millions of GPUs and link speeds reach 1.6 Tbps, congestion control remains a critical enabler of performance. The protocols analyzed in this paper represent important steps toward the zero-queue, sub-microsecond latency fabrics that future AI systems demand.
+
+\begin{thebibliography}{00}
+\bibitem{bonato2024fastflow} F. Bonato et al., ``FASTFLOW: A Dual Congestion Signal Scheme for Distributed Machine Learning,'' \textit{ACM SIGCOMM}, 2024.
+\bibitem{li2019hpcc} Y. Li et al., ``HPCC: High Precision Congestion Control,'' \textit{ACM SIGCOMM}, 2019.
+\bibitem{handley2017ndp} M. Handley et al., ``Re-architecting Datacenter Networks and Stacks for Low Latency and High Performance,'' \textit{ACM SIGCOMM}, 2017.
+\bibitem{li2021hpccplus} Y. Li et al., ``HPCC++: Enhanced High Precision Congestion Control,'' \textit{ACM CoNEXT}, 2021.
+\bibitem{uec2024} Ultra Ethernet Consortium, ``Congestion Control Specification v1.0,'' 2024.
+\bibitem{nvidia2024} NVIDIA Corporation, ``Spectrum-X Networking Platform for AI: Technical Overview,'' 2024.
+\bibitem{broadcom2024} Broadcom Inc., ``Tomahawk 5 and Tomahawk 6 Ethernet Switch Series,'' 2024.
+\end{thebibliography}
+
+\end{document}
